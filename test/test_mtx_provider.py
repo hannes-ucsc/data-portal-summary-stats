@@ -4,6 +4,7 @@ from abc import (
 )
 import os
 import unittest
+from unittest import mock
 
 import responses
 
@@ -31,8 +32,9 @@ class TestMatrixProvider(ABC):
 
 class TestFresh(TempdirTestCase, TestMatrixProvider):
     project_field_name = 'project.provenance.document_id'
-    azul_endpoint = 'https://service.explore.data.humancellatlas.org/repository/projects/'
-    hca_endpoint = 'https://matrix.data.humancellatlas.org/v1/'
+
+    url_get1 = f'{config.hca_matrix_service_endpoint}filters/{project_field_name}'
+    url_post = f'{config.hca_matrix_service_endpoint}matrix/'
 
     def setUp(self):
         super().setUp()
@@ -48,7 +50,7 @@ class TestFresh(TempdirTestCase, TestMatrixProvider):
 
         responses.add(
             responses.GET,
-            f'{self.hca_endpoint}filters/{self.project_field_name}',
+            self.url_get1,
             json={
                 'cell_counts': cell_counts,
                 'field_description': 'Unique identifier for overall project.',
@@ -62,15 +64,14 @@ class TestFresh(TempdirTestCase, TestMatrixProvider):
     @responses.activate
     def test_obtain_matrix(self):
         request_id = '3c44455c-d751-4fc9-a119-3a55c05f8990'
-        url_get1 = os.path.join(self.hca_endpoint, 'filters/project.provenance.document_id')
-        url_post = os.path.join(self.hca_endpoint, 'matrix')
-        url_get2 = os.path.join(self.hca_endpoint + f'matrix/{request_id}')
+
+        url_get2 = f'{config.hca_matrix_service_endpoint}matrix/{request_id}'
         matrix_url = 'https://s3.amazonaws.com/fake-matrix-service-results/0/424242/13-13.mtx.zip'
 
         # First response: GET (to satisfy the assertion):
         responses.add(
             responses.GET,
-            url_get1,
+            self.url_get1,
             json={
                 'cell_counts': {
                     'e7d811e2-832a-4452-85a5-989e2f8267bf': 2,
@@ -80,7 +81,7 @@ class TestFresh(TempdirTestCase, TestMatrixProvider):
         # Second response: POST:
         responses.add(
             responses.POST,
-            url_post,
+            self.url_post,
             json={
                 'message': 'Job started.',
                 'non_human_request_ids': {},
@@ -112,7 +113,7 @@ class TestFresh(TempdirTestCase, TestMatrixProvider):
         responses.add(responses.GET, matrix_url, status=200, stream=True)
 
         responses.add(responses.GET,
-                      self.azul_endpoint,
+                      config.azul_project_endpoint,
                       json={
                           'foo': 'bar'
                       })
@@ -136,7 +137,7 @@ class TestCanned(TempdirTestCase, S3TestCase, TestMatrixProvider):
     def test_get_entity_ids(self):
         uuids = {'123', '456', '789', 'bad'}
         for uuid in uuids:
-            self.client.put_object(Bucket=self.bucket_name,
+            self.client.put_object(Bucket=config.s3_bucket_name,
                                    Key=f'{config.s3_canned_matrix_prefix}{uuid}.mtx.zip')
         self.assertEqual(set(self.provider.get_entity_ids()), uuids)
 

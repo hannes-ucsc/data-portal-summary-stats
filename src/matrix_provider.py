@@ -11,6 +11,7 @@ from typing import (
     Dict,
     Union,
     Any,
+    Optional,
 )
 import urllib.parse
 
@@ -211,12 +212,9 @@ class FreshMatrixProvider(MatrixProvider):
         """
         search_after = ''
         projects = {}
-        while True:
+        while search_after is not None:
             response_json = requests.get(config.azul_project_endpoint + search_after).json()
-            try:
-                hits = response_json['hits']
-            except KeyError:
-                break
+            hits = response_json['hits']
 
             projects.update({
                 hit['entryId']: {
@@ -227,21 +225,24 @@ class FreshMatrixProvider(MatrixProvider):
             })
 
             pagination = response_json['pagination']
-            search_after = '?' + self._make_string_url_compliant_for_search_after(
+            search_after = self._get_seach_afer_params(
                 pagination['search_after'],
                 pagination['search_after_uid']
             )
         return projects
 
     @staticmethod
-    def _make_string_url_compliant_for_search_after(project_title: str, document_id: str) -> str:
+    def _get_seach_afer_params(project_title: Optional[str], document_id: Optional[str]) -> Optional[str]:
         """
         Return input string to be URL compliant, i.e., replacing special characters by their
         corresponding hexadecimal representation.
         """
-        project_title = urllib.parse.quote(project_title)
-        document_id = urllib.parse.quote(f'#{document_id}')
-        return f'search_after={project_title}&search_after_uid=doc{document_id}'
+        if document_id is None:
+            return None
+        else:
+            project_title = urllib.parse.quote(project_title)
+            document_id = urllib.parse.quote(document_id)
+            return f'?search_after={project_title}&search_after_uid={document_id}'
 
     @staticmethod
     def check_response(response):
@@ -265,5 +266,3 @@ class FreshMatrixProvider(MatrixProvider):
             return min(min_gene_func(lca) for lca in lcas)
         else:
             return min_gene_func(None)
-
-

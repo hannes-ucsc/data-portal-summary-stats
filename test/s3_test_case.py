@@ -7,7 +7,6 @@ from moto import (
 )
 
 from src import (
-    Config,
     config,
 )
 
