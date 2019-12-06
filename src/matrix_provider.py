@@ -9,20 +9,24 @@ import time
 from typing import (
     List,
     Dict,
+    Union,
     Any,
-    Optional,
 )
 import urllib.parse
 
 import requests
 
+from src import config
 from src.matrix_info import MatrixInfo
+from src.matrix_summary_stats import MatrixSummaryStats
 from src.utils import (
     convert_size,
     file_id,
     remove_ext,
 )
-from more_itertools import first
+from more_itertools import (
+    one,
+)
 
 log = logging.getLogger(__name__)
 
@@ -109,30 +113,31 @@ class FreshMatrixProvider(MatrixProvider):
     def __init__(self, **kwargs):
         """
         :param kwargs:
-        Required:
-        config: src.Config - config object providing endpoints
-        Optional:
-            min_gene_count: int - Minimum genes for cells to be included in
-            downloaded matrix.
         Other params defined in superclass.
         """
-        config = kwargs.pop('config')
-        self.hca_endpoint = config.hca_matrix_service_endpoint
-        self.azul_endpoint = config.azul_project_endpoint
-        self.min_gene_count = kwargs.pop('min_gene_count', 0)
         super().__init__(**kwargs)
 
-        self.projects = self._get_project_uuids_from_azul()
+        self.projects = self._get_project_info_from_azul()
+
+    @property
+    def hca_matrix_service_project_list_url(self):
+        return f'{config.hca_matrix_service_endpoint}filters/{self.project_id_field}'
+
+    @property
+    def hca_matrix_service_request_url(self):
+        return f'{config.hca_matrix_service_endpoint}matrix/'
 
     def get_entity_ids(self):
-        """Return list matrix directory names (with prefix keys) from matrix service"""
-        response = requests.get(f'{self.hca_endpoint}filters/{self.project_id_field}')
+        """
+        Return list of matrix directory names (with prefix keys) from matrix service
+        """
+        response = requests.get(self.hca_matrix_service_project_list_url)
         self.check_response(response)
         return list(response.json()['cell_counts'].keys())
 
     def obtain_matrix(self, project_id: str) -> MatrixInfo:
         log.info(f'Requesting matrix from project {project_id} from HCA.')
-        project_title = self.get_project_title(project_id)
+        project_title = self.get_project_field(project_id, 'project_title')
         if project_title is None:
             log.info(f'No project title found for project ID {project_id} in Azul')
         else:
@@ -152,12 +157,10 @@ class FreshMatrixProvider(MatrixProvider):
         return MatrixInfo(source='fresh',
                           project_uuid=project_id,
                           zip_path=matrix_zipfile_name,
-                          extract_path=remove_ext(matrix_zipfile_name, '.zip'))
+                          extract_path=remove_ext(matrix_zipfile_name, '.zip'),
+                          lib_con_approaches=frozenset(self.get_project_field(project_id, 'project_lca', {})))
 
-    def _request_matrix(self, project_document_id: str) -> requests.models.Response:
-
-        list_projects_url = self.hca_endpoint + 'filters/' + self.project_id_field
-        assert project_document_id in requests.get(list_projects_url).json()['cell_counts']
+    def _request_matrix(self, project_id: str) -> requests.models.Response:
 
         payload = {
             'feature': self.mtx_feature,
@@ -167,30 +170,31 @@ class FreshMatrixProvider(MatrixProvider):
                 'value': [
                     {
                         'op': '=',
-                        'value': project_document_id,
+                        'value': project_id,
                         'field': self.project_id_field
                     },
                     {
                         'op': '>=',
-                        'value': self.min_gene_count,
+                        'value': self.get_gene_threshold(project_id),
                         'field': self.min_gene_count_field
                     }
                 ]
             }
         }
 
-        log.info(f'Requesting expression matrix for project document ID {project_document_id}')
+        log.info(f'Requesting expression matrix for project document ID {project_id}')
         log.info(f'Request payload and filter settings: {payload}')
-        response = requests.post(self.hca_endpoint + 'matrix', json=payload)
+        response = requests.post(self.hca_matrix_service_request_url, json=payload)
+        request_id = response.json()["request_id"]
         self.check_response(response)
         minute_counter = 0
         while True:
-            status_response = requests.get(f'{self.hca_endpoint}matrix/{response.json()["request_id"]}')
+            status_response = requests.get(self.hca_matrix_service_request_url + request_id)
             status = status_response.json()['status']
             if status == 'Complete':
                 break
             elif status == 'In Progress':
-                log.info(f'Matrix request status: {status_response.json()["status"]}...')
+                log.info(f'Matrix request status: {status}...')
                 time.sleep(30)
                 minute_counter += 0.5
             else:
@@ -199,31 +203,42 @@ class FreshMatrixProvider(MatrixProvider):
 
         return status_response
 
-    def _get_project_uuids_from_azul(self) -> List[Dict[str, Any]]:
-        """Get all project UUIDs from Azul by using the service APIs search_after query parameter."""
+    def _get_project_info_from_azul(self) -> Dict[str, Dict[str, Union[str, List[str]]]]:
+        """
+        Get all projects from Azul by using the service APIs search_after query parameter.
+        :return: dictionary of project id's to relevant project fields:
+        title and library construction approach.
+        """
         search_after = ''
+        projects = {}
         while True:
-            response = requests.get(self.azul_endpoint + search_after)
+            response_json = requests.get(config.azul_project_endpoint + search_after).json()
             try:
-                hits = response.json()['hits']
+                hits = response_json['hits']
             except KeyError:
                 break
 
-            for hit in hits:
-                yield {
-                    'project_title': first(hit['projects'])['projectTitle'],
-                    'project_UUID': hit['entryId']
+            projects.update({
+                hit['entryId']: {
+                    'project_title': one(hit['projects'])['projectTitle'],
+                    'project_lca': one(hit['protocols'])['libraryConstructionApproach']
                 }
+                for hit in hits
+            })
 
+            pagination = response_json['pagination']
             search_after = '?' + self._make_string_url_compliant_for_search_after(
-                project_title=first(hits[-1]['projects'])['projectTitle'],
-                document_id=hits[-1]['entryId']
+                pagination['search_after'],
+                pagination['search_after_uid']
             )
+        return projects
 
     @staticmethod
     def _make_string_url_compliant_for_search_after(project_title: str, document_id: str) -> str:
-        """Return input string to be URL compliant, i.e., replacing special characters by their
-         corresponding hexadecimal representation."""
+        """
+        Return input string to be URL compliant, i.e., replacing special characters by their
+        corresponding hexadecimal representation.
+        """
         project_title = urllib.parse.quote(project_title)
         document_id = urllib.parse.quote(f'#{document_id}')
         return f'search_after={project_title}&search_after_uid=doc{document_id}'
@@ -235,6 +250,20 @@ class FreshMatrixProvider(MatrixProvider):
         except requests.exceptions.HTTPError as err:
             log.warning(f'{str(err)}')
 
-    def get_project_title(self, project_id: str) -> Optional[str]:
-        matches = (project['project_title'] for project in self.projects if project['project_UUID'] == project_id)
-        return first(matches, None)
+    def get_project_field(self, project_id: str, field: str, default: Any = None) -> Any:
+        try:
+            project = self.projects[project_id]
+        except KeyError:
+            return default
+        else:
+            return project[field]
+
+    def get_gene_threshold(self, project_id: str) -> int:
+        lcas = self.get_project_field(project_id, 'project_lca')
+        min_gene_func = MatrixSummaryStats.get_min_gene_count
+        if lcas:
+            return min(min_gene_func(lca) for lca in lcas)
+        else:
+            return min_gene_func(None)
+
+

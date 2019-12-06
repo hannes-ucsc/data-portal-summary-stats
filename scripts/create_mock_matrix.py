@@ -1,43 +1,40 @@
 #!./.venv/bin/python
-import logging
 import os
 import shutil
 
-from src import Config
 from src.matrix_preparer import MatrixPreparer
 from src.matrix_provider import CannedMatrixProvider
 from src.s3_service import S3Service
 from src.utils import DirectoryChange
 from test.tempdir_test_case import MockMatrixTestCase
 
-log = logging.getLogger(__name__)
-
 
 def main():
     os.environ['AWS_DEFAULT_PROFILE'] = 'hca-id'
-    s3 = S3Service(Config('dev'))
+    s3 = S3Service()
     provider = CannedMatrixProvider(s3_service=s3)
     with DirectoryChange('../test/'):
-        log.info('Entering test directory')
+        print('Entering test directory')
         mtxinfo = next(iter(provider))
-        log.info(f'Obtained matrix: {mtxinfo.zip_path}')
+        print(f'Obtained matrix: {mtxinfo.zip_path}')
         prep = MatrixPreparer(mtxinfo)
-        log.info('Processing...')
+        print('Processing...')
         prep.unzip()
         prep.prune(0.05)
 
-    log.info('Copying to notebook dir')
+    print('Copying to notebook dir')
+    shutil.rmtree(f'../notebook/{mtxinfo.extract_path}', ignore_errors=True)
     shutil.copytree(f'../test/{mtxinfo.extract_path}', f'../notebook/{mtxinfo.extract_path}')
 
     with DirectoryChange('../notebook'):
-        log.info('Preprocessing files for notebook')
+        print('Preprocessing files for notebook')
         prep.preprocess()
 
     with DirectoryChange('../test/'):
-        log.info('Recompressing')
+        print('Recompressing')
         prep.rezip(remove_dir=True, zip_path=MockMatrixTestCase.mock_matrix)
 
-    log.info('Finished.')
+    print('Finished.')
 
 
 if __name__ == '__main__':

@@ -7,7 +7,7 @@ import unittest
 
 import responses
 
-from src import Config
+from src import config
 from src.matrix_provider import (
     CannedMatrixProvider,
     FreshMatrixProvider,
@@ -36,9 +36,7 @@ class TestFresh(TempdirTestCase, TestMatrixProvider):
 
     def setUp(self):
         super().setUp()
-        self.provider = FreshMatrixProvider(blacklist=['bad'],
-                                            config=Config('prod'),
-                                            min_gene_count=1200)
+        self.provider = FreshMatrixProvider(blacklist=['bad'])
 
     @responses.activate
     def test_get_entity_ids(self):
@@ -129,8 +127,7 @@ class TestCanned(TempdirTestCase, S3TestCase, TestMatrixProvider):
         TempdirTestCase.setUp(self)
         S3TestCase.setUp(self)
         self.provider = CannedMatrixProvider(blacklist=['bad'],
-                                             s3_service=S3Service(self.config),
-                                             config=self.config)
+                                             s3_service=S3Service())
 
     def tearDown(self):
         S3TestCase.tearDown(self)
@@ -140,15 +137,15 @@ class TestCanned(TempdirTestCase, S3TestCase, TestMatrixProvider):
         uuids = {'123', '456', '789', 'bad'}
         for uuid in uuids:
             self.client.put_object(Bucket=self.bucket_name,
-                                   Key=f'{self.config.s3_canned_matrix_prefix}{uuid}.mtx.zip')
+                                   Key=f'{config.s3_canned_matrix_prefix}{uuid}.mtx.zip')
         self.assertEqual(set(self.provider.get_entity_ids()), uuids)
 
     def test_obtain_matrix(self):
         uuid = '123'
         key = uuid + '.mtx.zip'
         with TemporaryDirectoryChange():
-            self.client.put_object(Bucket=self.bucket_name,
-                                   Key=self.config.s3_canned_matrix_prefix + key)
+            self.client.put_object(Bucket=config.s3_bucket_name,
+                                   Key=config.s3_canned_matrix_prefix + key)
             mtx_info = self.provider.obtain_matrix(uuid)
             self.assertEqual(os.listdir('.'), [key])
             self.assertEqual(mtx_info.zip_path, key)

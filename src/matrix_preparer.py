@@ -1,22 +1,17 @@
-from functools import lru_cache
 import gzip
 import logging
 import os
 import warnings
 
-from more_itertools import (
-    first,
-    one,
-)
 import numpy as np
 import pandas as pd
 import shutil
 from typing import (
     List,
-    Optional,
     Tuple,
     Callable,
     Union,
+    FrozenSet,
 )
 from zipfile import ZipFile
 
@@ -30,29 +25,30 @@ log = logging.getLogger(__name__)
 
 
 class MatrixPreparer:
-    library_method_column = 'analysis_protocol.protocol_core.protocol_id'
+    lca_column = 'library_preparation_protocol.library_construction_method.ontology_label'
 
-    zipped_files = {
+    hca_zipped_filenames = {
         'genes': 'genes.tsv.gz',
         'barcodes': 'cells.tsv.gz',
         'matrix': 'matrix.mtx.gz'
     }
 
-    unproc_files = {
+    hca_filenames = {
         'genes': 'genes.tsv',
         'barcodes': 'cells.tsv',
         'matrix': 'matrix.mtx'
     }
 
-    proc_files = {
+    scanpy_filenames = {
         'genes': 'genes.tsv',
         'barcodes': 'barcodes.tsv',
         'matrix': 'matrix.mtx'
     }
 
-    file_columns = {
-        'matrix': None,
-        'barcodes': ['cellkey', library_method_column],
+    scanpy_tsv_columns = {
+        # library_method_column is included because it is needed for separation,
+        # not for scanpy
+        'barcodes': ['cellkey', lca_column],
         'genes': ['featurekey', 'featurename']
     }
 
@@ -77,10 +73,10 @@ class MatrixPreparer:
 
         extracted_files = os.listdir(self.info.extract_path)
         assert 3 <= len(extracted_files) <= 4  # optional readme
-        assert all(filename in extracted_files for filename in self.zipped_files.values())
+        assert all(filename in extracted_files for filename in self.hca_zipped_filenames.values())
 
         with DirectoryChange(self.info.extract_path):
-            for gzfilename in self.zipped_files.values():
+            for gzfilename in self.hca_zipped_filenames.values():
                 with gzip.open(gzfilename, 'rb') as gzfile:
                     filename = remove_ext(gzfilename, '.gz')
                     with open(filename, 'wb') as outfile:
@@ -92,11 +88,13 @@ class MatrixPreparer:
         Extract gzip files and transform for ScanPy compatibility.
         """
         with DirectoryChange(self.info.extract_path):
-            for filekey, filename in self.unproc_files.items():
+            for filekey, filename in self.hca_filenames.items():
                 log.info(f'Processing file {filename}')
-                self._preprocess(remove_ext(filename, '.gz'),
-                                 keep_cols=self.file_columns[filekey],
-                                 rename=self.proc_files[filekey])
+                if filename.endswith('.tsv'):
+                    self._preprocess_tsv(filename, self.scanpy_tsv_columns[filekey])
+                elif filename.endswith('.mtx'):
+                    self._preprocess_mtx(filename)
+                os.rename(filename, self.scanpy_filenames[filekey])
 
     def prune(self, keep_frac: float) -> None:
         """
@@ -108,75 +106,73 @@ class MatrixPreparer:
         """
         if not (0 < keep_frac <= 1):
             raise ValueError(f'Invalid prune fraction: {keep_frac}')
-        mtx_path = os.path.join(self.info.extract_path, self.proc_files['matrix'])
+        mtx_path = os.path.join(self.info.extract_path, self.scanpy_filenames['matrix'])
         header, mtx = self._read_matrixmarket(mtx_path)
-        entries = mtx.index[1:]
+        entries = np.arange(1, mtx.index.size)
         keep_rows = np.random.choice(entries, round(keep_frac * entries.size), replace=False)
         mtx = self._filter_matrix_entries(mtx, pd.Series(keep_rows))
         self._write_matrixmarket(mtx_path, header, mtx)
 
-    def separate(self, strip_version: bool = True) -> List[MatrixInfo]:
+    def separate(self) -> List[MatrixInfo]:
         """
-        Split matrix into independent entities based on library construction method.
+        Split matrix into independent entities based on library construction approach.
 
-        If the LCM is homogeneous, no change is made to the directory structure.
+        If the LCA is homogeneous, no change is made to the directory structure.
         Otherwise, a new directory is created within the extraction directory
-        for every observed library prep method and populated with the subset of
-        matrix.mtx corresponding to that method.
+        for every observed LCA and populated with the subset of matrix.mtx
+        corresponding to that approach.
         Links are created for the row and column tsv files, which remain in the
         top-level extraction dir.
-        :param strip_version: if true, best effort is made to strip version
-        identifiers from the end of the LCM strings to conglomerate different
-        versions of the same protocol.
-        :return: list of MatrixInfo objects describing the results of the
+        :return: series of MatrixInfo objects describing the results of the
         separation.
         """
-        # Column headers have been removed so it takes a bit of footwork to
-        # access the lib prep method field in pandas
-        library_method_column_index = 1
-        barcode_column_index = 1
-
         log.info('Separating by library construction method...')
 
         with DirectoryChange(self.info.extract_path):
-            barcodes_file = self.proc_files['barcodes']
-            barcodes = pd.read_csv(barcodes_file, sep='\t', header=None)
-            lib_con_data = barcodes.pop(barcodes.columns[library_method_column_index])
+            barcodes_file = self.scanpy_filenames['barcodes']
+            barcodes = self._read_tsv(barcodes_file, False)
+            lib_con_data = barcodes.pop(barcodes.columns[1])
             self._write_tsv(barcodes_file, barcodes)
 
-            if strip_version:
-                lib_con_data = lib_con_data.map(self.strip_version_suffix)
+            found_lcas = frozenset(lib_con_data.unique())
+            assert len(found_lcas) > 0
 
-            lib_con_methods = lib_con_data.unique()
-            assert len(lib_con_methods) > 0
+            if not self.info.lib_con_approaches:
+                self.info.lib_con_approaches = found_lcas
+            elif self.info.lib_con_approaches != found_lcas:
+                raise RuntimeError(
+                    'The provided matrix library construction approach does not match the extracted files:'
+                    f'Provided: {self.info} Found: {found_lcas}'
+                )
 
-            if len(lib_con_methods) == 1:
-                log.info('Homogeneous LCM.')
-                self.info.lib_con_method = first(lib_con_data)
+            if len(self.info.lib_con_approaches) == 1:
+                log.info('Homogeneous LCA.')
                 return [self.info]
             else:
-                for lib_con_method in lib_con_methods:
-                    log.info(f'Consolidating {lib_con_method} cells')
-                    os.mkdir(lib_con_method)
-                    with DirectoryChange(lib_con_method):
-                        for filekey, filename in self.proc_files.items():
-                            if filekey == 'matrix':
-                                def matrix_filter(entry):
-                                    barcode_lineno = entry[barcode_column_index]
-                                    entry_method = lib_con_data.iloc[barcode_lineno - 1]
-                                    return entry_method == lib_con_method
+                for lca in self.info.lib_con_approaches:
+                    log.info(f'Consolidating {lca} cells')
+                    os.mkdir(lca)
 
+                    def matrix_filter(entry):
+                        barcode_lineno = entry[1]
+                        entry_lca = lib_con_data.iloc[barcode_lineno - 1]
+                        return entry_lca == lca
+
+                    with DirectoryChange(lca):
+                        for filekey, filename in self.scanpy_filenames.items():
+                            if filekey == 'matrix':
                                 header, mtx = self._read_matrixmarket(f'../{filename}')
                                 mtx = self._filter_matrix_entries(mtx, matrix_filter)
                                 self._write_matrixmarket(filename, header, mtx)
                             else:
                                 os.symlink(f'../{filename}', filename)
+
                 return [MatrixInfo(source=self.info.source,
                                    project_uuid=self.info.project_uuid,
                                    zip_path=None,
-                                   extract_path=os.path.join(self.info.extract_path, lib_con_method),
-                                   lib_con_method=lib_con_method)
-                        for lib_con_method in lib_con_methods]
+                                   extract_path=os.path.join(self.info.extract_path, lca),
+                                   lib_con_approaches=frozenset({lca}))
+                        for lca in self.info.lib_con_approaches]
 
     def rezip(self, zip_path: str = None, remove_dir: bool = False) -> None:
         """
@@ -192,8 +188,8 @@ class MatrixPreparer:
 
         with ZipFile(self.info.zip_path, 'w') as zipfile:
             with DirectoryChange(self.info.extract_path):
-                for gzfilename, filename in zip(self.zipped_files.values(),
-                                                self.unproc_files.values()):
+                for gzfilename, filename in zip(self.hca_zipped_filenames.values(),
+                                                self.hca_filenames.values()):
                     with open(filename, 'rb') as infile:
                         with gzip.open(gzfilename, 'wb') as gzfile:
                             shutil.copyfileobj(infile, gzfile)
@@ -202,51 +198,6 @@ class MatrixPreparer:
 
         if remove_dir:
             shutil.rmtree(self.info.extract_path)
-
-    @classmethod
-    def strip_version_suffix(cls, protocol: str):
-        """
-        >>> MatrixPreparer.strip_version_suffix('smartseq2_v2.4.0')
-        'smartseq2'
-        """
-        parts = protocol.split('_')
-        if len(parts) != 2:
-            raise RuntimeError(f'Library protocol {protocol} does not properly define a version')
-        return parts[0]
-
-    @classmethod
-    def _filter_matrix_axis(cls,
-                            mtx: pd.DataFrame,
-                            axis_idx_subset: pd.Index,
-                            axis: int):
-        """
-        Remove entries in a matrix market matrix file to reflect a reduced set
-        of values is a matrix market row or column file.
-        This is not necessary to remove entries from the matrix. It is only
-        necessary when entries have been removed from the row or column file and
-        the matrix file must be updated to avoid incorrect line number
-        references.
-        :param mtx: matrix market entry dataframe.
-        :param axis_idx_subset: index containing a subset of the line numbers
-        referenced in either the rows or columns of the matrix file.
-        :param axis: 1 for rows, 2 for columns.
-        :return: matrix with entries referencing absent row or column numbers
-        removed and size info updated.
-        """
-        # align index to 1-based line numbers in axis (row or column) file
-        axis_idx_subset = axis_idx_subset + 1
-
-        # remove entries referencing missing row/columns
-        mtx = cls._filter_matrix_entries(mtx, lambda entry: entry[axis] in axis_idx_subset)
-
-        # realign references in matrix file to 1-based line numbers in axis file.
-        collapser = lru_cache(maxsize=1)(lambda i: one(np.flatnonzero(axis_idx_subset == i)) + 1)
-        mtx.iloc[1:, 1] = mtx.iloc[1:, 1].map(collapser)
-
-        # update size of axis file
-        mtx.iloc[0, axis] = axis_idx_subset.size
-
-        return mtx
 
     @classmethod
     def _filter_matrix_entries(cls,
@@ -260,10 +211,10 @@ class MatrixPreparer:
         :return: the modified matrix.
         """
         if callable(which_rows):
-            keep_labels = mtx.iloc[1:, :].apply(which_rows, axis=1)
+            keep_labels = mtx.iloc[1:].apply(which_rows, axis=1)
             mtx = mtx.drop(labels=1 + np.flatnonzero(~keep_labels))
         else:
-            mtx = mtx.iloc[pd.concat([pd.Series(0), which_rows]), :]
+            mtx = mtx.iloc[pd.concat([pd.Series(0), which_rows])]
         with warnings.catch_warnings():
             warnings.simplefilter('ignore')
             # Pandas complains about this modification because it at this point
@@ -274,29 +225,32 @@ class MatrixPreparer:
         return mtx
 
     @classmethod
-    def _preprocess(cls,
-                    infile_name: str,
-                    keep_cols: Optional[List[str]] = None,
-                    rename: Optional[str] = None) -> None:
+    def _preprocess_tsv(cls,
+                        filename: str,
+                        keep_cols: List[str]) -> None:
         """
-        :param infile_name: name of un-gzipped, unprocessed file
-        :param keep_cols: columns to keep. None to skip column selection.
-        :param rename: name of the unzipped, processed file to write to
+        :param filename: name of un-gzipped, unprocessed file
+        :param keep_cols: columns to keep.
         """
-        if infile_name == cls.unproc_files['matrix']:
-            # ScanPy requires gene expression to be int for some reason
-            # TODO Normalize?
-            header, df = cls._read_matrixmarket(infile_name)
-            df.iloc[:, 2] = np.rint(df.iloc[:, 2]).astype(int)
-            cls._write_matrixmarket(infile_name, header, df)
-        elif keep_cols is not None:
-            df = pd.read_table(infile_name, sep='\t')
-            assert all(col in df.columns for col in keep_cols)
-            df = df[keep_cols]
-            cls._write_tsv(infile_name, df)
+        df = cls._read_tsv(filename, True)
+        assert all(col in df.columns for col in keep_cols)
+        df = df[keep_cols]
+        cls._write_tsv(filename, df)
 
-        if rename is not None:
-            os.rename(infile_name, rename)
+    @classmethod
+    def _preprocess_mtx(cls,
+                        filename: str) -> None:
+        # ScanPy requires gene expression to be int for some reason
+        # TODO Normalize?
+        header, df = cls._read_matrixmarket(filename)
+        df.iloc[:, 2] = np.rint(df.iloc[:, 2]).astype(int)
+        cls._write_matrixmarket(filename, header, df)
+
+    @classmethod
+    def _read_tsv(cls, path: str, header: bool, **pd_kwargs) -> pd.DataFrame:
+        if not header:
+            pd_kwargs['header'] = None
+        return pd.read_csv(path, index_col=None, sep='\t', **pd_kwargs)
 
     @classmethod
     def _write_tsv(cls, path: str, df: pd.DataFrame, **pd_kwargs) -> None:
@@ -307,7 +261,9 @@ class MatrixPreparer:
         with open(path) as f:
             header = f.readline()
         assert header.startswith('%')
-        df = pd.read_csv(path, header=None, comment='%', sep=' ', **pd_kwargs)
+        # float_precision is needed here or gene expression accumulates rounding
+        # errors that cause rows to compare unequal
+        df = pd.read_csv(path, header=None, comment='%', sep=' ', float_precision='round_trip', **pd_kwargs)
         return header, df
 
     @classmethod

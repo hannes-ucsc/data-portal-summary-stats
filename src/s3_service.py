@@ -2,12 +2,11 @@ import logging
 import os
 from typing import (
     List,
-    Dict,
 )
 
 import boto3
 
-from src import Config
+from src import config
 from src.matrix_info import MatrixInfo
 
 log = logging.getLogger(__name__)
@@ -15,7 +14,7 @@ log = logging.getLogger(__name__)
 
 class S3Service:
 
-    def __init__(self, config: Config):
+    def __init__(self):
         log.info('Initializing S3 service...')
         self.client = boto3.client('s3')
         self.bucket_name = config.s3_bucket_name
@@ -42,10 +41,7 @@ class S3Service:
     def upload_figures(self, mtx_info: MatrixInfo) -> None:
         figures = os.listdir('figures/')
         for figure in figures:
-            folder = mtx_info.project_uuid
-            if mtx_info.lib_con_method is not None:
-                folder = '/'.join([folder, mtx_info.lib_con_method])
-            key = self.key_prefixes['figures'] + '/'.join([folder, figure])
+            key = f'{self.key_prefixes["figures"]}{mtx_info.figures_folder}{figure}'
             log.info(f'Uploading {figure} to S3 bucket {self.bucket_name} as {key}')
             self.client.upload_file(Filename=f'figures/{figure}',
                                     Bucket=self.bucket_name,

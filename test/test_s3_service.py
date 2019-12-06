@@ -1,7 +1,7 @@
 import os
 import unittest
 
-from src import Config
+from src import config
 from src.matrix_info import MatrixInfo
 from src.s3_service import S3Service
 from src.utils import TemporaryDirectoryChange
@@ -12,18 +12,18 @@ class TestS3Service(S3TestCase):
 
     def setUp(self) -> None:
         super().setUp()
-        self.s3 = S3Service(Config('dev'))
+        self.s3 = S3Service()
 
     def test_list_bucket(self):
         target = 'matrices'
         keys = self.s3.list_bucket(target)
         self.assertEqual(keys, [])
 
-        target_key = self.config.s3_canned_matrix_prefix + 'foo'
-        self.client.put_object(Bucket=self.bucket_name,
+        target_key = config.s3_canned_matrix_prefix + 'foo'
+        self.client.put_object(Bucket=config.s3_bucket_name,
                                Key=target_key,
                                Body=b'Hi')
-        self.client.put_object(Bucket=self.bucket_name,
+        self.client.put_object(Bucket=config.s3_bucket_name,
                                Key='non-target',
                                Body=b'Bye')
         keys = self.s3.list_bucket(target)
@@ -31,15 +31,15 @@ class TestS3Service(S3TestCase):
 
     def test_download(self):
         key = 'hi'
-        self.client.put_object(Bucket=self.bucket_name,
-                               Key=self.config.s3_canned_matrix_prefix + key,
+        self.client.put_object(Bucket=config.s3_bucket_name,
+                               Key=config.s3_canned_matrix_prefix + key,
                                Body=b'Hi')
         with TemporaryDirectoryChange():
             self.s3.download('matrices', key)
             self.assertEqual(os.listdir('.'), [key])
 
     def test_get_blacklist(self):
-        self.client.put_object(Bucket=self.bucket_name,
+        self.client.put_object(Bucket=config.s3_bucket_name,
                                Key=f'blacklist',
                                Body=b'123\n456\n789\n')
 
@@ -60,7 +60,7 @@ class TestS3Service(S3TestCase):
                                               extract_path='N/A',
                                               project_uuid=project_uuid))
             found_objects = set(self.s3.list_bucket('figures'))
-            expected_objects = {f'{self.config.s3_figures_prefix}{project_uuid}/{file}' for file in figures_files}
+            expected_objects = {f'{config.s3_figures_prefix}{project_uuid}/{file}' for file in figures_files}
             self.assertEqual(found_objects, expected_objects)
 
 

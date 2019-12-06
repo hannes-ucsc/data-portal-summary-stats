@@ -1,3 +1,6 @@
+from typing import Optional
+
+from more_itertools import one
 import pandas as pd
 import scanpy as sc
 import numpy as np
@@ -7,7 +10,7 @@ import warnings
 
 from src.matrix_info import MatrixInfo
 
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
 # See https://stackoverflow.com/questions/27147300/
 # matplotlib-tcl-asyncdelete-async-handler-deleted-by-the-wrong-thread
@@ -16,31 +19,33 @@ matplotlib.use('Agg')
 
 
 class MatrixSummaryStats:
-
-    min_gene_counts = {
-        # Fill this in for different lib-con methods
-        'smartseq2': 0,
-        'optimus': 0
-    }
-
-    # PLACEHOLDER
-    default_min_gene_count = 0
-
     # What to do for this parameter?
     min_cell_count = 10
 
+    MIN_GENE_COUNT_10X = 1200
+    MIN_GENE_COUNT_SMARTSEQ2 = 1200
+    MIN_GENE_COUNT_UNKNOWN_METHOD = 1200
+
     @classmethod
-    def global_min_gene_count(cls):
-        return min(cls.default_min_gene_count, *cls.min_gene_counts.values())
+    def get_min_gene_count(cls, library_construction_approach: Optional[str]) -> int:
+        if library_construction_approach is None:
+            return cls.MIN_GENE_COUNT_UNKNOWN_METHOD
+        else:
+            if library_construction_approach.startswith('10X'):
+                return cls.MIN_GENE_COUNT_10X
+            elif library_construction_approach == 'Smart-seq2':
+                return cls.MIN_GENE_COUNT_SMARTSEQ2
+            else:
+                return cls.MIN_GENE_COUNT_UNKNOWN_METHOD
 
     def __init__(self, mtx_info: MatrixInfo):
         self.info = mtx_info
-        self.min_gene_count = self.min_gene_counts.get(self.info.lib_con_method, self.default_min_gene_count)
+        self.lca = one(self.info.lib_con_approaches)
 
     def create_images(self) -> None:
         figure_format = '.png'
-        logger.info(f'Figures saved in {figure_format} format.')
-        logger.info(f'Path to matrix files is {self.info.extract_path}')
+        log.info(f'Figures saved in {figure_format} format.')
+        log.info(f'Path to matrix files is {self.info.extract_path}')
 
         # SHOULDN'T '/figures/' be in a path somewhere? Or does scanpy automatically create
         # and populate that directory?
@@ -52,7 +57,7 @@ class MatrixSummaryStats:
 
         # 2. Figure: Violin plots of cells, all genes, and percent of mitochondrial genes
 
-        sc.pp.filter_cells(adata, min_genes=self.min_gene_count)
+        sc.pp.filter_cells(adata, min_genes=self.get_min_gene_count(self.lca))
         sc.pp.filter_genes(adata, min_cells=self.min_cell_count)
 
         mito_genes = adata.var_names.str.startswith('MT-')

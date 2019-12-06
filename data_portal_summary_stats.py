@@ -1,10 +1,20 @@
 #!/usr/env/python3
 
-import os
-import argparse
 import logging
-from src.runner import run_data_portal_summary_stats
+import time
+import os
 
+from src import config
+from src.matrix_preparer import MatrixPreparer
+from src.matrix_provider import (
+    FreshMatrixProvider,
+    CannedMatrixProvider,
+)
+from src.matrix_summary_stats import MatrixSummaryStats
+from src.s3_service import S3Service
+from src.utils import TemporaryDirectoryChange
+
+log = logging.getLogger(__name__)
 
 # Set up logging
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -19,37 +29,48 @@ logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description='Per-project summary statistics and figures.'
-    )
-    args_group = parser.add_argument_group(title='arguments')
-    args_group.add_argument(
-        '--stage',
-        default='dev',
-        choices=('dev', 'integration', 'staging', 'prod'),
-        type=str,
-        help='Deployment stage (default: "dev") from which '
-             'matrix data are requested to create summary '
-             'statistics.'
-    )
-    args_group.add_argument(
-        '--source',
-        default='fresh',
-        choices=('fresh', 'canned'),
-        type=str,
-        help='Source of matrix files. "fresh" (default) denotes requesting '
-             'matrix files from the matrix service. "canned" denotes '
-             'downloading already created matrix files from AWS S3.'
-    )
-    args_group.add_argument(
-        '--blacklist',
-        action='store_true',
-        help='Skip files with project IDs listed in a file named '
-             '"blacklist" during processing if flag is set.'
-    )
-    args = parser.parse_args()
+    log.info(f'\nGenerating per-project summary statistics of matrix data from '
+             f'{config.deployment_stage} deployment environment.\n')
 
-    run_data_portal_summary_stats(args)
+    s3 = S3Service()
+
+    # Temporary work-around for matrices that can't be processed for various reasons.
+    do_not_process = s3.get_blacklist() if config.use_blacklist else []
+
+    if config.matrix_source == 'fresh':
+        provider = FreshMatrixProvider(blacklist=do_not_process)
+    elif config.matrix_source == 'canned':
+        provider = CannedMatrixProvider(blacklist=do_not_process,
+                                        s3_service=s3)
+    else:
+        assert False
+
+    log.info(f'Processing {config.matrix_source} matrices...')
+    iter_matrices = iter(provider)
+    while True:
+        with TemporaryDirectoryChange() as tempdir:
+            try:
+                mtx_info = next(iter_matrices)
+            except StopIteration:
+                break
+            log.info(f'Writing to temporary directory {tempdir}')
+            log.info(f'Processing matrix for project {mtx_info.project_uuid} ({mtx_info.source})')
+
+            preparer = MatrixPreparer(mtx_info)
+            preparer.unzip()
+            preparer.preprocess()
+
+            for sep_mtx_info in preparer.separate():
+                log.info(f'Generating stats for {sep_mtx_info.extract_path}')
+                mss = MatrixSummaryStats(sep_mtx_info)
+                mss.create_images()
+                s3.upload_figures(mtx_info)
+                log.info('Finished uploading figures')
+
+                # This logic was in Krause's code, no idea why
+                if mtx_info.source == 'fresh':
+                    time.sleep(15)
+    log.info('Finished.')
 
 
 if __name__ == "__main__":
